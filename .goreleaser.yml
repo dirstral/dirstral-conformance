@@ -1,0 +1,5 @@
+project_name: dirstral-conformance
+release:
+  prerelease: auto
+builds:
+  - skip: true
