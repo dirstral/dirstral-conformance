@@ -24,4 +24,4 @@ jobs:
       - name: Build
         run: go test ./... -run TestDoesNotExist
       - name: Suite compile
-        run: go test ./conformance/... -run TestMain -count=1
+        run: go test ./conformance/... -run TestDoesNotExist -count=1
