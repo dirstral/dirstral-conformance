@@ -34,7 +34,13 @@ gating mode behavior. It never imports server internals.
 
 There is no `Makefile` and nothing to compile into a binary — this is a test-only repo.
 
-Compile-check the suite (this is exactly what CI does):
+Compile-check all packages (CI "Build" step):
+
+```bash
+go test ./... -run TestDoesNotExist
+```
+
+Compile-check the conformance suite (CI "Suite compile" step):
 
 ```bash
 go test ./conformance/... -run TestDoesNotExist -count=1

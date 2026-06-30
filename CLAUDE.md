@@ -27,7 +27,11 @@ specific implementation.
 
 There is no `Makefile` and no binary to build — this repo is purely a Go test suite.
 
-- Compile-check the suite (what CI runs):
+- Compile-check all packages (mirrors CI's "Build" step):
+  ```bash
+  go test ./... -run TestDoesNotExist
+  ```
+- Compile-check the conformance suite (mirrors CI's "Suite compile" step):
   ```bash
   go test ./conformance/... -run TestDoesNotExist -count=1
   ```
