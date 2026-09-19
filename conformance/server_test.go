@@ -157,6 +157,7 @@ func (s *server) waitForListenAddr(stdout interface{ Read([]byte) (int, error) }
 	found := make(chan string, 1)
 	failed := make(chan error, 1)
 	go func() {
+		announced := false
 		scanner := bufio.NewScanner(stdout)
 		scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 		for scanner.Scan() {
@@ -174,12 +175,27 @@ func (s *server) waitForListenAddr(stdout interface{ Read([]byte) (int, error) }
 				return
 			}
 			if ev.Data.URL != "" {
+				announced = true
 				select {
 				case found <- ev.Data.URL:
 				default:
 				}
 				// Keep draining: a full pipe buffer would block the server.
 			}
+		}
+		// Stdout ended. If it ended BEFORE the listening event, say so now:
+		// otherwise every test waits out the full boot timeout to learn that
+		// a server which had already died was never going to answer.
+		if announced {
+			return
+		}
+		err := scanner.Err()
+		if err == nil {
+			err = fmt.Errorf("stdout closed without a listening event")
+		}
+		select {
+		case failed <- fmt.Errorf("server stopped before it began serving: %w", err):
+		default:
 		}
 	}()
 

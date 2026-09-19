@@ -35,15 +35,25 @@ func requiredNames(t *testing.T, tool map[string]interface{}, name string) []str
 	if schema == nil {
 		return nil
 	}
-	listed, ok := schema["required"].([]interface{})
+	raw, present := schema["required"]
+	if !present {
+		return nil
+	}
+	listed, ok := raw.([]interface{})
 	if !ok {
+		// Silently returning nil made every "is this field required?" answer
+		// "no", so a malformed schema passed the optionality assertions.
+		t.Errorf("%s outputSchema `required` is %T, not an array", name, raw)
 		return nil
 	}
 	out := make([]string, 0, len(listed))
-	for _, entry := range listed {
-		if field, ok := entry.(string); ok {
-			out = append(out, field)
+	for i, entry := range listed {
+		field, ok := entry.(string)
+		if !ok {
+			t.Errorf("%s outputSchema `required`[%d] is %T, not a string", name, i, entry)
+			continue
 		}
+		out = append(out, field)
 	}
 	return out
 }
@@ -60,10 +70,15 @@ func assertEnum(t *testing.T, label string, field map[string]interface{}, want .
 		return
 	}
 	got := make([]string, 0, len(listed))
-	for _, entry := range listed {
-		if value, ok := entry.(string); ok {
-			got = append(got, value)
+	for i, entry := range listed {
+		value, ok := entry.(string)
+		if !ok {
+			// Dropping it silently let an enum of the right strings PLUS a
+			// number satisfy both the length and the membership check.
+			t.Errorf("%s enum[%d] is %T, not a string: %v", label, i, entry, entry)
+			continue
 		}
+		got = append(got, value)
 	}
 	if len(got) != len(want) {
 		t.Errorf("%s enum = %v, spec says %v", label, got, want)

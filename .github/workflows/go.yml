@@ -18,6 +18,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The workflow token would otherwise persist in this checkout's git
+          # config, readable by anything that runs afterwards. This job
+          # compiles and executes code from another repository, so that is not
+          # a theoretical reader (CWE-522).
+          persist-credentials: false
       - uses: actions/setup-go@v5
         with:
           go-version: '1.24.2'
@@ -38,6 +44,7 @@ jobs:
           repository: dirstral/dir2mcp
           path: .impl/dir2mcp
           submodules: recursive
+          persist-credentials: false
       - name: Compile it
         working-directory: .impl/dir2mcp
         run: go build -o "$GITHUB_WORKSPACE/.impl/dir2mcp-bin" ./cmd/dir2mcp/

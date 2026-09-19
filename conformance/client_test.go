@@ -15,7 +15,29 @@ import (
 // declares no dependencies and a conformance harness that needed an SDK would
 // be testing the SDK's idea of the protocol rather than the wire contract.
 
+// protocolVersion is what the harness OFFERS. supportedProtocols is what it
+// will accept back: a server may negotiate down, and a conformance client has
+// to notice rather than keep talking at its own version.
 const protocolVersion = "2025-11-25"
+
+var supportedProtocols = []string{"2025-11-25", "2025-06-18", "2025-03-26"}
+
+func supportedProtocol(version string) bool {
+	for _, candidate := range supportedProtocols {
+		if candidate == version {
+			return true
+		}
+	}
+	return false
+}
+
+// protocolHeader is the version every request after initialize carries.
+func (c *client) protocolHeader() string {
+	if c.negotiated != "" {
+		return c.negotiated
+	}
+	return protocolVersion
+}
 
 type rpcError struct {
 	Code    int             `json:"code"`
@@ -29,6 +51,13 @@ type client struct {
 	url       string
 	sessionID string
 	next      int
+	// lastStatus is the HTTP status of the most recent reply. The spec makes
+	// the transport status part of the contract (a TOOL error is HTTP 200
+	// with isError true, not a 5xx), so callers can assert it.
+	lastStatus int
+	// negotiated is the protocol version the server chose at initialize.
+	// Every later request carries it, rather than the one we asked for.
+	negotiated string
 }
 
 // dial performs the initialize handshake and returns a ready client.
@@ -49,6 +78,19 @@ func dial(t *testing.T, srv *server) *client {
 	if _, ok := res["serverInfo"]; !ok {
 		t.Fatalf("initialize result declares no serverInfo: %s", raw)
 	}
+	// protocolVersion is REQUIRED on InitializeResult, and the server may pick
+	// a different one from the one asked for. Ignoring it left the client
+	// asserting against a version the server never agreed to, and sending that
+	// version in every later header.
+	negotiated, ok := res["protocolVersion"].(string)
+	if !ok || negotiated == "" {
+		t.Fatalf("initialize result declares no protocolVersion: %s", raw)
+	}
+	if !supportedProtocol(negotiated) {
+		t.Fatalf("server negotiated protocol %q, which this harness does not speak (it offers %v)",
+			negotiated, supportedProtocols)
+	}
+	c.negotiated = negotiated
 	// MCP requires the client to confirm the handshake before issuing any
 	// other request. Skipping it is refused with SESSION_NOT_INITIALIZED,
 	// which the harness found on its first run against a real server.
@@ -74,7 +116,7 @@ func (c *client) notify(ctx context.Context, method string, params interface{}) 
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
-	req.Header.Set("MCP-Protocol-Version", protocolVersion)
+	req.Header.Set("MCP-Protocol-Version", c.protocolHeader())
 	if c.sessionID != "" {
 		req.Header.Set("MCP-Session-Id", c.sessionID)
 	}
@@ -117,7 +159,7 @@ func (c *client) call(ctx context.Context, method string, params interface{}) (m
 	// Both, because a streamable-HTTP server may answer either way and a
 	// conformance client must not force one.
 	req.Header.Set("Accept", "application/json, text/event-stream")
-	req.Header.Set("MCP-Protocol-Version", protocolVersion)
+	req.Header.Set("MCP-Protocol-Version", c.protocolHeader())
 	if c.sessionID != "" {
 		req.Header.Set("MCP-Session-Id", c.sessionID)
 	}
@@ -135,36 +177,99 @@ func (c *client) call(ctx context.Context, method string, params interface{}) (m
 		c.sessionID = id
 	}
 
-	text := unwrapSSE(string(payload))
-	var envelope struct {
-		Result map[string]interface{} `json:"result"`
-		Error  *rpcError              `json:"error"`
+	text := string(payload)
+	envelope, err := selectResponse(text, c.next)
+	if err != nil {
+		return nil, text, fmt.Errorf("%s: status %d: %w", method, resp.StatusCode, err)
 	}
-	if err := json.Unmarshal([]byte(text), &envelope); err != nil {
-		return nil, text, fmt.Errorf("%s: status %d, undecodable body: %w", method, resp.StatusCode, err)
-	}
+	// The transport status is part of the contract, so it travels with the
+	// result instead of being consulted only when decoding failed. A 500
+	// carrying a JSON-RPC error would otherwise satisfy any caller that
+	// checks `err != nil` and nothing else.
+	c.lastStatus = resp.StatusCode
 	if envelope.Error != nil {
 		return nil, text, envelope.Error
 	}
 	return envelope.Result, text, nil
 }
 
-// unwrapSSE extracts the JSON payload from a text/event-stream response.
-// A server answering application/json is passed through unchanged.
-func unwrapSSE(body string) string {
-	if !strings.Contains(body, "data:") {
-		return body
+type rpcEnvelope struct {
+	ID     interface{}            `json:"id"`
+	Result map[string]interface{} `json:"result"`
+	Error  *rpcError              `json:"error"`
+}
+
+// selectResponse finds the reply to request id among everything the server
+// sent, and ignores the rest.
+//
+// Streamable HTTP allows a server to interleave its own requests and
+// notifications ahead of the response. Concatenating every `data:` field
+// produced one invalid JSON value as soon as that happened, so each event is
+// decoded on its own and correlated by id.
+func selectResponse(body string, id int) (*rpcEnvelope, error) {
+	messages := sseMessages(body)
+	if len(messages) == 0 {
+		return nil, fmt.Errorf("no JSON-RPC message in the body: %s", truncate(body))
 	}
-	var out []string
-	for _, line := range strings.Split(body, "\n") {
-		if rest, ok := strings.CutPrefix(strings.TrimSpace(line), "data:"); ok {
-			out = append(out, strings.TrimSpace(rest))
+	var decodeErr error
+	for _, message := range messages {
+		var envelope rpcEnvelope
+		if err := json.Unmarshal([]byte(message), &envelope); err != nil {
+			decodeErr = err
+			continue
+		}
+		// A notification carries no id and is never the reply.
+		if envelope.ID == nil {
+			continue
+		}
+		if number, ok := envelope.ID.(float64); ok && int(number) == id {
+			return &envelope, nil
 		}
 	}
-	if len(out) == 0 {
-		return body
+	if decodeErr != nil {
+		return nil, fmt.Errorf("undecodable message: %w", decodeErr)
 	}
-	return strings.Join(out, "")
+	return nil, fmt.Errorf("no reply to request id %d: %s", id, truncate(body))
+}
+
+// sseMessages splits a body into candidate JSON-RPC messages: one per SSE
+// event, or the whole body when the server answered application/json.
+func sseMessages(body string) []string {
+	if !strings.Contains(body, "data:") {
+		if strings.TrimSpace(body) == "" {
+			return nil
+		}
+		return []string{body}
+	}
+	var messages []string
+	var current []string
+	flush := func() {
+		if len(current) > 0 {
+			messages = append(messages, strings.Join(current, "\n"))
+			current = nil
+		}
+	}
+	for _, line := range strings.Split(body, "\n") {
+		trimmed := strings.TrimRight(line, "\r")
+		if strings.TrimSpace(trimmed) == "" {
+			// A blank line terminates one SSE event.
+			flush()
+			continue
+		}
+		if rest, ok := strings.CutPrefix(trimmed, "data:"); ok {
+			current = append(current, strings.TrimSpace(rest))
+		}
+	}
+	flush()
+	return messages
+}
+
+func truncate(s string) string {
+	const limit = 400
+	if len(s) <= limit {
+		return s
+	}
+	return s[:limit] + "..."
 }
 
 // tools returns tools/list keyed by tool name.
@@ -197,6 +302,7 @@ func (c *client) tools(t *testing.T) map[string]map[string]interface{} {
 
 // toolResult is the decoded shape of a tools/call reply.
 type toolResult struct {
+	Status     int
 	IsError    bool
 	Structured map[string]interface{}
 	Text       string
@@ -214,7 +320,14 @@ func (c *client) callTool(t *testing.T, name string, args map[string]interface{}
 	if err != nil {
 		t.Fatalf("tools/call %s: %v", name, err)
 	}
-	out := toolResult{Raw: raw}
+	// SPEC: a TOOL-execution error is HTTP 200 with isError true, not a 5xx.
+	// Without this, a server that 500s on a bad argument satisfies every
+	// isError assertion below and the harness calls it conformant.
+	if c.lastStatus != http.StatusOK {
+		t.Fatalf("tools/call %s returned HTTP %d; a tool error is 200 with isError true: %s",
+			name, c.lastStatus, raw)
+	}
+	out := toolResult{Raw: raw, Status: c.lastStatus}
 	if flag, ok := res["isError"].(bool); ok {
 		out.IsError = flag
 	}
