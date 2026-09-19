@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"strings"
 	"testing"
@@ -178,7 +179,7 @@ func (c *client) call(ctx context.Context, method string, params interface{}) (m
 	}
 
 	text := string(payload)
-	envelope, err := selectResponse(text, c.next)
+	envelope, err := selectResponse(text, resp.Header.Get("Content-Type"), c.next)
 	if err != nil {
 		return nil, text, fmt.Errorf("%s: status %d: %w", method, resp.StatusCode, err)
 	}
@@ -188,6 +189,14 @@ func (c *client) call(ctx context.Context, method string, params interface{}) (m
 	// checks `err != nil` and nothing else.
 	c.lastStatus = resp.StatusCode
 	if envelope.Error != nil {
+		// A JSON-RPC error is still carried on a 200 unless the transport
+		// itself failed. Returning it without checking let an HTTP 500 satisfy
+		// every caller that tests `err != nil` and nothing more, so a server
+		// that 500s on an unknown tool read as correctly refusing it.
+		if resp.StatusCode != http.StatusOK {
+			return nil, text, fmt.Errorf("%s: HTTP %d carrying a JSON-RPC error (%w)",
+				method, resp.StatusCode, envelope.Error)
+		}
 		return nil, text, envelope.Error
 	}
 	return envelope.Result, text, nil
@@ -206,8 +215,8 @@ type rpcEnvelope struct {
 // notifications ahead of the response. Concatenating every `data:` field
 // produced one invalid JSON value as soon as that happened, so each event is
 // decoded on its own and correlated by id.
-func selectResponse(body string, id int) (*rpcEnvelope, error) {
-	messages := sseMessages(body)
+func selectResponse(body, contentType string, id int) (*rpcEnvelope, error) {
+	messages := sseMessages(body, contentType)
 	if len(messages) == 0 {
 		return nil, fmt.Errorf("no JSON-RPC message in the body: %s", truncate(body))
 	}
@@ -234,8 +243,13 @@ func selectResponse(body string, id int) (*rpcEnvelope, error) {
 
 // sseMessages splits a body into candidate JSON-RPC messages: one per SSE
 // event, or the whole body when the server answered application/json.
-func sseMessages(body string) []string {
-	if !strings.Contains(body, "data:") {
+//
+// The choice is made from the declared media type, never from the body.
+// Sniffing for "data:" misparsed a perfectly good JSON reply whose error
+// message or tool content happened to contain that substring, which a server
+// echoing a user's text can produce at any time.
+func sseMessages(body, contentType string) []string {
+	if !isEventStream(contentType) {
 		if strings.TrimSpace(body) == "" {
 			return nil
 		}
@@ -262,6 +276,16 @@ func sseMessages(body string) []string {
 	}
 	flush()
 	return messages
+}
+
+// isEventStream reports whether the declared media type is SSE, ignoring
+// parameters such as "; charset=utf-8".
+func isEventStream(contentType string) bool {
+	parsed, _, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		return false
+	}
+	return parsed == "text/event-stream"
 }
 
 func truncate(s string) string {

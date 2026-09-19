@@ -17,7 +17,8 @@ Operational guide for coding agents working in this repository.
 
 dirstral-conformance is a language-agnostic, black-box conformance harness for
 `dirstral-spec` compliant MCP servers. It launches a server binary (chosen via
-the `DIR2MCP_BINARY` env var) over stdio or HTTP and asserts lifecycle/session
+the `DIR2MCP_BINARY` env var) and speaks MCP to it over Streamable HTTP,
+asserting lifecycle/session
 behavior, tool schema conformance, canonical error behavior, and x402 request-
 gating mode behavior. It never imports server internals.
 
@@ -69,7 +70,7 @@ Notes:
 
 - Work only in this repository unless explicitly instructed otherwise.
 - **Never** import dir2mcp or any server's internals; interact only through the
-  spawned binary over stdio/HTTP. This rule is the whole point of the harness.
+  spawned binary over Streamable HTTP. This rule is the whole point of the harness.
 - Keep all tests in the `conformance/` package and assert only externally-
   observable behavior (handshake, tool schemas, response shapes, canonical error
   codes, x402 modes).
