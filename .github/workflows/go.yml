@@ -25,3 +25,23 @@ jobs:
         run: go test ./... -run TestDoesNotExist
       - name: Suite compile
         run: go test ./conformance/... -run TestDoesNotExist -count=1
+      # The suite is only worth having if it RUNS. Until this step existed, CI
+      # proved the stubs compiled and nothing else, and the repo reported green
+      # for six months while asserting nothing about any server.
+      #
+      # The reference implementation is built from source here rather than
+      # downloaded, so the gate tracks its main rather than its last release.
+      # A second implementation would add its own build step and reuse the run.
+      - name: Build the reference implementation
+        uses: actions/checkout@v4
+        with:
+          repository: dirstral/dir2mcp
+          path: .impl/dir2mcp
+          submodules: recursive
+      - name: Compile it
+        working-directory: .impl/dir2mcp
+        run: go build -o "$GITHUB_WORKSPACE/.impl/dir2mcp-bin" ./cmd/dir2mcp/
+      - name: Run the conformance suite against it
+        env:
+          DIR2MCP_BINARY: ${{ github.workspace }}/.impl/dir2mcp-bin
+        run: go test ./conformance/... -count=1 -v
